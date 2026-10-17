@@ -9,6 +9,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/reader/reader_aloud_controller.dart';
+import 'online_tts_engine.dart';
 
 class TtsVoiceOption {
   final String name;
@@ -198,39 +199,63 @@ class TtsService extends ChangeNotifier
   List<TtsVoiceOption> _availableVoices = const <TtsVoiceOption>[];
   TtsVoiceOption? _currentVoice;
   String? _androidTtsEngine;
+  OnlineTtsEngine? _onlineEngine;
+  bool _onlineEnabled = false;
   final FlutterTts Function() _ttsFactory;
 
+  /// 在线 TTS 已启用且引擎就绪时，所有朗读操作委托给在线引擎。
+  bool get _onlineActive => _onlineEnabled && _onlineEngine != null;
+
+  OnlineTtsEngine? get _online => _onlineActive ? _onlineEngine : null;
+
   @override
-  bool get isPlaying => _isPlaying;
+  bool get isPlaying => _online?.isPlaying ?? _isPlaying;
   @override
-  bool get isPaused => _isPaused;
+  bool get isPaused => _online?.isPaused ?? _isPaused;
+  @override
+  int get currentPosition => _online?.currentPosition ?? _currentPosition;
   @override
   bool get supportsContinuousText => false;
   @override
   bool get supportsQueuedText =>
-      !kIsWeb &&
-      (defaultTargetPlatform == TargetPlatform.android ||
-          defaultTargetPlatform == TargetPlatform.iOS);
+      _onlineActive || (!kIsWeb && _systemPlatformSupportsQueuedText);
   bool get isInitialized => _isInitialized;
   bool get isInitializing => _isInitializing;
   bool get isAvailable => _isInitialized;
   String? get lastError => _lastError;
   String? get lastErrorLanguage => _lastErrorLanguage;
   @override
-  double get speechRate => _speechRate;
+  double get speechRate => _online?.speechRate ?? _speechRate;
   @override
-  double get speechVolume => _speechVolume;
+  double get speechVolume => _online?.speechVolume ?? _speechVolume;
   double get speechPitch => _speechPitch;
   String get currentLanguage => _currentLanguage;
   List<String> get availableLanguages => _availableLanguages;
+  String get currentVoiceLabel => _currentVoice?.title ?? 'system_default';
+
+  static bool get _systemPlatformSupportsQueuedText =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
+  /// 是否处于在线 TTS 模式。
+  bool get isOnlineMode => _onlineActive;
+
+  List<OnlineSpeaker> get onlineSpeakers =>
+      _onlineEngine?.speakers ?? kBuiltinOnlineSpeakers;
+
+  String get currentOnlineSpeaker => _onlineEngine?.speaker ?? '温柔桃子';
+
+  bool get isLoadingOnlineSpeakers => _onlineEngine?.isLoadingSpeakers ?? false;
+
+  String? get onlineSpeakerLoadError => _onlineEngine?.speakerLoadError;
+
   String get currentText => _currentText;
-  @override
-  int get currentPosition => _currentPosition;
   bool get isLoadingVoices => _isLoadingVoices;
   String? get voiceLoadError => _voiceLoadError;
-  List<TtsVoiceOption> get availableVoices => _availableVoices;
-  TtsVoiceOption? get currentVoice => _currentVoice;
-  String get currentVoiceLabel => _currentVoice?.title ?? 'system_default';
+  List<TtsVoiceOption> get availableVoices =>
+      _onlineActive ? const <TtsVoiceOption>[] : _availableVoices;
+  TtsVoiceOption? get currentVoice => _onlineActive ? null : _currentVoice;
 
   TtsService({FlutterTts Function()? ttsFactory})
     : _ttsFactory = ttsFactory ?? FlutterTts.new {
@@ -303,6 +328,59 @@ class TtsService extends ChangeNotifier
   Future<void> retryInitialize() async {
     await initialize(force: true);
   }
+
+  /// 创建并挂载在线 TTS 引擎，状态变化经 [_relayChange] 转发给 UI。
+  OnlineTtsEngine _attachOnlineEngine() {
+    final existing = _onlineEngine;
+    if (existing != null) {
+      return existing;
+    }
+    final engine = OnlineTtsEngine();
+    engine.addListener(_relayChange);
+    _onlineEngine = engine;
+    return engine;
+  }
+
+  Future<void> setOnlineTtsEnabled(bool value) async {
+    if (_onlineEnabled == value) return;
+    if (value) {
+      _onlineEnabled = true;
+      final engine = _attachOnlineEngine();
+      await _saveSettings();
+      _notifySafe();
+      // 开关打开时立即探测服务，失败不阻塞界面，仅记录错误。
+      unawaited(engine.testConnection());
+      return;
+    }
+    _onlineEnabled = false;
+    await _saveSettings();
+    _notifySafe();
+    await stop();
+  }
+
+  Future<void> setOnlineServerUrl(String url) async {
+    final engine = _attachOnlineEngine();
+    await engine.setServerUrl(url);
+  }
+
+  Future<void> setOnlineSpeaker(String speaker) async {
+    final engine = _attachOnlineEngine();
+    await engine.setSpeaker(speaker);
+  }
+
+  Future<void> refreshOnlineSpeakers() async {
+    final engine = _onlineEngine;
+    if (engine == null) return;
+    await engine.refreshSpeakers();
+  }
+
+  Future<String?> testOnlineConnection() async {
+    final engine = _attachOnlineEngine();
+    return engine.testConnection();
+  }
+
+  String get onlineServerUrl =>
+      _onlineEngine?.serverUrl ?? 'http://192.168.1.74:3456';
 
   Future<void> _configureSystemTts(FlutterTts tts) async {
     await tts.awaitSpeakCompletion(true);
@@ -492,6 +570,11 @@ class TtsService extends ChangeNotifier
   Future<void> ensureVoicesLoaded({bool force = false}) async {
     if (_isDisposed) return;
 
+    final online = _online;
+    if (online != null) {
+      return online.refreshSpeakers();
+    }
+
     if (!force && _availableVoices.isNotEmpty) {
       return;
     }
@@ -537,6 +620,8 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> setVoice(TtsVoiceOption voice) async {
+    // 在线模式的音色由 setOnlineSpeaker 管理。
+    if (_onlineActive) return;
     await initialize();
     final tts = _flutterTts;
     if (!_isInitialized || tts == null) {
@@ -566,6 +651,7 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> clearSelectedVoice() async {
+    if (_onlineActive) return;
     await initialize();
     final tts = _flutterTts;
     if (!_isInitialized || tts == null) {
@@ -716,6 +802,11 @@ class TtsService extends ChangeNotifier
       return;
     }
 
+    final online = _online;
+    if (online != null) {
+      return online.speak(content);
+    }
+
     await initialize();
     final tts = _flutterTts;
     if (!_isInitialized || tts == null) {
@@ -814,6 +905,11 @@ class TtsService extends ChangeNotifier
         .toList(growable: false);
     if (contents.isEmpty) return;
 
+    final online = _online;
+    if (online != null) {
+      return online.speakQueued(contents, onTextStarted: onTextStarted);
+    }
+
     await initialize();
     final tts = _flutterTts;
     if (!_isInitialized || tts == null || !supportsQueuedText) {
@@ -891,6 +987,10 @@ class TtsService extends ChangeNotifier
 
   @override
   Future<void> pause() async {
+    final online = _online;
+    if (online != null) {
+      return online.pause();
+    }
     final tts = _flutterTts;
     if (!_isInitialized || tts == null || !_isPlaying || _isPaused) {
       return;
@@ -922,6 +1022,10 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> resume() async {
+    final online = _online;
+    if (online != null) {
+      return online.resume();
+    }
     final tts = _flutterTts;
     if (!_isInitialized || tts == null || !_isPaused) {
       return;
@@ -951,6 +1055,10 @@ class TtsService extends ChangeNotifier
   Future<void> stop() async {
     _webStartTimer?.cancel();
     _webStartTimer = null;
+    final online = _online;
+    if (online != null) {
+      return online.stop();
+    }
     final tts = _flutterTts;
     if (tts == null) {
       return;
@@ -975,6 +1083,10 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> setSpeechRate(double rate) async {
+    final online = _online;
+    if (online != null) {
+      return online.setSpeechRate(rate);
+    }
     _speechRate = rate.clamp(0.1, 1.0);
     final tts = _flutterTts;
     if (tts != null) {
@@ -985,6 +1097,10 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> setVolume(double volume) async {
+    final online = _online;
+    if (online != null) {
+      return online.setVolume(volume);
+    }
     _speechVolume = volume.clamp(0.0, 1.0);
     final tts = _flutterTts;
     if (tts != null) {
@@ -995,6 +1111,8 @@ class TtsService extends ChangeNotifier
   }
 
   Future<void> setPitch(double pitch) async {
+    // 在线 TTS 服务不暴露音调参数，仅系统模式生效。
+    if (_onlineActive) return;
     _speechPitch = pitch.clamp(0.5, 2.0);
     final tts = _flutterTts;
     if (tts != null) {
@@ -1101,6 +1219,7 @@ class TtsService extends ChangeNotifier
     if (normalized.isEmpty) {
       return;
     }
+    if (_onlineActive) return;
 
     _currentLanguage = normalized;
     await _saveSettings();
@@ -1149,6 +1268,10 @@ class TtsService extends ChangeNotifier
   Future<void> _loadSettings() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      _onlineEnabled = prefs.getBool('tts_online_enabled') ?? false;
+      if (_onlineEnabled && _onlineEngine == null) {
+        _attachOnlineEngine();
+      }
       _speechRate =
           (prefs.getDouble('tts_speech_rate') ??
                   prefs.getDouble('ttsSpeed') ??
@@ -1188,6 +1311,7 @@ class TtsService extends ChangeNotifier
   Future<void> _saveSettings() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('tts_online_enabled', _onlineEnabled);
       await prefs.setDouble('tts_speech_rate', _speechRate);
       await prefs.setDouble('tts_speech_volume', _speechVolume);
       await prefs.setDouble('tts_speech_pitch', _speechPitch);
@@ -1393,6 +1517,9 @@ class TtsService extends ChangeNotifier
     notifyListeners();
   }
 
+  /// 在线引擎状态变化转发给本服务的监听者（UI 同时监听 TtsService）。
+  void _relayChange() => _notifySafe();
+
   @override
   void dispose() {
     _isDisposed = true;
@@ -1405,6 +1532,12 @@ class TtsService extends ChangeNotifier
     _initializationFuture = null;
     if (tts != null) {
       unawaited(_disposeNativeTts(tts));
+    }
+    final online = _onlineEngine;
+    _onlineEngine = null;
+    if (online != null) {
+      online.removeListener(_relayChange);
+      online.dispose();
     }
     super.dispose();
   }
