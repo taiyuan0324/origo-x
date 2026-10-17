@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/reader/reader_aloud_controller.dart';
+import '../services/online_tts_engine.dart';
 import '../services/reader_aloud_service.dart';
 import '../services/tts_service.dart';
 import '../utils/reader_themes.dart';
@@ -244,9 +245,30 @@ class ReaderAloudPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final online = ttsService.isOnlineMode;
     return Column(
       mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        SwitchListTile.adaptive(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('在线 TTS（豆包）'),
+          subtitle: Text(
+            online ? ttsService.onlineServerUrl : '关闭时使用系统语音',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          value: online,
+          onChanged: (value) =>
+              unawaited(ttsService.setOnlineTtsEnabled(value)),
+        ),
+        if (online) ...[
+          _OnlineServerUrlField(ttsService: ttsService),
+          const SizedBox(height: 4),
+          _OnlineSpeakerSelector(ttsService: ttsService),
+          _OnlineConnectionTest(ttsService: ttsService),
+          const SizedBox(height: 4),
+        ],
         _SettingSlider(
           label: '语速',
           value: ttsService.speechRate,
@@ -261,33 +283,35 @@ class ReaderAloudPanel extends StatelessWidget {
           max: 1,
           onChanged: ttsService.setVolume,
         ),
-        _SettingSlider(
-          label: '音调',
-          value: ttsService.speechPitch,
-          min: 0.5,
-          max: 2,
-          onChanged: ttsService.setPitch,
-        ),
-        if (ttsService.availableVoices.isNotEmpty)
-          DropdownButtonFormField<TtsVoiceOption>(
-            initialValue: ttsService.currentVoice,
-            decoration: const InputDecoration(labelText: '系统语音'),
-            items: [
-              for (final voice in ttsService.availableVoices)
-                DropdownMenuItem(
-                  value: voice,
-                  child: Text(
-                    voice.subtitle.isEmpty
-                        ? voice.title
-                        : '${voice.title} · ${voice.subtitle}',
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-            ],
-            onChanged: (voice) {
-              if (voice != null) unawaited(ttsService.setVoice(voice));
-            },
+        if (!online) ...[
+          _SettingSlider(
+            label: '音调',
+            value: ttsService.speechPitch,
+            min: 0.5,
+            max: 2,
+            onChanged: ttsService.setPitch,
           ),
+          if (ttsService.availableVoices.isNotEmpty)
+            DropdownButtonFormField<TtsVoiceOption>(
+              initialValue: ttsService.currentVoice,
+              decoration: const InputDecoration(labelText: '系统语音'),
+              items: [
+                for (final voice in ttsService.availableVoices)
+                  DropdownMenuItem(
+                    value: voice,
+                    child: Text(
+                      voice.subtitle.isEmpty
+                          ? voice.title
+                          : '${voice.title} · ${voice.subtitle}',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+              ],
+              onChanged: (voice) {
+                if (voice != null) unawaited(ttsService.setVoice(voice));
+              },
+            ),
+        ],
         SwitchListTile.adaptive(
           contentPadding: EdgeInsets.zero,
           title: const Text('朗读时跟随页面'),
@@ -297,6 +321,177 @@ class ReaderAloudPanel extends StatelessWidget {
       ],
     );
   }
+}
+
+class _OnlineServerUrlField extends StatefulWidget {
+  const _OnlineServerUrlField({required this.ttsService});
+
+  final TtsService ttsService;
+
+  @override
+  State<_OnlineServerUrlField> createState() => _OnlineServerUrlFieldState();
+}
+
+class _OnlineServerUrlFieldState extends State<_OnlineServerUrlField> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.ttsService.onlineServerUrl,
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final url = _controller.text.trim();
+    if (url.isEmpty) return;
+    unawaited(widget.ttsService.setOnlineServerUrl(url));
+  }
+
+  @override
+  Widget build(BuildContext context) => TextField(
+    controller: _controller,
+    decoration: InputDecoration(
+      labelText: '服务地址',
+      hintText: 'http://192.168.1.74:3456',
+      suffixIcon: IconButton(
+        tooltip: '保存并刷新音色',
+        icon: const Icon(Icons.save_rounded),
+        onPressed: _submit,
+      ),
+    ),
+    keyboardType: TextInputType.url,
+    autocorrect: false,
+    textInputAction: TextInputAction.done,
+    onSubmitted: (_) => _submit(),
+  );
+}
+
+class _OnlineSpeakerSelector extends StatelessWidget {
+  const _OnlineSpeakerSelector({required this.ttsService});
+
+  final TtsService ttsService;
+
+  @override
+  Widget build(BuildContext context) {
+    final speakers = ttsService.onlineSpeakers;
+    final current = ttsService.currentOnlineSpeaker;
+    if (ttsService.isLoadingOnlineSpeakers && speakers.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 12),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final groups = <String, List<OnlineSpeaker>>{};
+    for (final speaker in speakers) {
+      groups
+          .putIfAbsent(speaker.category, () => <OnlineSpeaker>[])
+          .add(speaker);
+    }
+    final selected = speakers.firstWhere(
+      (speaker) => speaker.name == current,
+      orElse: () => speakers.first,
+    );
+    return DropdownButtonFormField<OnlineSpeaker>(
+      initialValue: selected,
+      isExpanded: true,
+      decoration: const InputDecoration(labelText: '在线音色'),
+      selectedItemBuilder: (context) => [
+        for (final speaker in speakers)
+          Text(speaker.name, overflow: TextOverflow.ellipsis),
+      ],
+      items: [
+        for (final entry in groups.entries) ...[
+          DropdownMenuItem<OnlineSpeaker>(
+            enabled: false,
+            child: Text(
+              OnlineSpeaker(name: '', category: entry.key).categoryLabel,
+              style: Theme.of(context).textTheme.labelSmall,
+            ),
+          ),
+          for (final speaker in entry.value)
+            DropdownMenuItem<OnlineSpeaker>(
+              value: speaker,
+              child: Text(speaker.name, overflow: TextOverflow.ellipsis),
+            ),
+        ],
+      ],
+      onChanged: (speaker) {
+        if (speaker != null) {
+          unawaited(ttsService.setOnlineSpeaker(speaker.name));
+        }
+      },
+    );
+  }
+}
+
+class _OnlineConnectionTest extends StatefulWidget {
+  const _OnlineConnectionTest({required this.ttsService});
+
+  final TtsService ttsService;
+
+  @override
+  State<_OnlineConnectionTest> createState() => _OnlineConnectionTestState();
+}
+
+class _OnlineConnectionTestState extends State<_OnlineConnectionTest> {
+  bool _testing = false;
+  String? _result;
+
+  Future<void> _test() async {
+    setState(() {
+      _testing = true;
+      _result = null;
+    });
+    final error = await widget.ttsService.testOnlineConnection();
+    if (!mounted) return;
+    setState(() {
+      _testing = false;
+      _result = error ?? '连接正常';
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(top: 4),
+    child: Row(
+      children: [
+        OutlinedButton.icon(
+          onPressed: _testing ? null : () => unawaited(_test()),
+          icon: _testing
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.wifi_tethering_rounded, size: 18),
+          label: const Text('测试连接'),
+        ),
+        if (_result != null) ...[
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              _result!,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: _result == '连接正常'
+                    ? Theme.of(context).colorScheme.primary
+                    : Theme.of(context).colorScheme.error,
+              ),
+            ),
+          ),
+        ],
+      ],
+    ),
+  );
 }
 
 class _SettingSlider extends StatelessWidget {
