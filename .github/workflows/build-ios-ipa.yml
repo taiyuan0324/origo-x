@@ -1,11 +1,13 @@
 name: Build local reader IPA (unsigned)
 
-# 手动触发：Fork 仓库 -> Actions -> "Build local reader IPA (unsigned)" -> Run workflow
+# push 到 main 自动构建；也可在 Actions 页面手动触发。
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-ipa:
@@ -54,3 +56,21 @@ jobs:
           path: dist/origo-x-local-reader.ipa
           if-no-files-found: error
           retention-days: 14
+
+      # 发布到固定 tag 的 Release：公开仓库的 Release 资产可匿名下载，
+      # 便于自动化交付（无需 token）。release 正文注明来源 commit 与 run 链接。
+      - name: Publish IPA to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=ipa-latest
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          NOTES=$(printf '本地阅读 IPA（未签名，Sideloadly 签名后安装）。\n\ncommit: %s\nrun: %s/%s/actions/runs/%s' "$SHA_SHORT" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "IPA 构建 ($SHA_SHORT)" --notes "$NOTES"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/origo-x-local-reader.ipa
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "IPA 构建 ($SHA_SHORT)" --notes "$NOTES" dist/origo-x-local-reader.ipa
+          fi
+          echo "Published: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
