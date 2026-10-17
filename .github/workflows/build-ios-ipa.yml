@@ -1,0 +1,50 @@
+name: Build local reader IPA (unsigned)
+
+# 手动触发：Fork 仓库 -> Actions -> "Build local reader IPA (unsigned)" -> Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    name: Flutter iOS IPA (no codesign)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies and generate localizations
+        run: |
+          set -euo pipefail
+          # 严格按 lockfile 解析（与仓库 public-source.yml 一致）；个别情况下回退到普通解析保证构建不中断
+          flutter pub get --enforce-lockfile || flutter pub get
+          flutter gen-l10n
+
+      - name: Static analysis gate
+        run: flutter analyze --no-pub
+
+      - name: Build unsigned release IPA
+        run: flutter build ipa --no-codesign --release --no-pub
+
+      - name: Collect IPA artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/ios/ipa/*.ipa dist/origo-x-local-reader.ipa
+          ls -lh dist/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: origo-x-local-reader-ipa
+          path: dist/origo-x-local-reader.ipa
+          if-no-files-found: error
+          retention-days: 14
