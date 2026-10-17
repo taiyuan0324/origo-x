@@ -1,6 +1,7 @@
 {
   "edition": "local-reader",
   "files": [
+    ".github/workflows/build-ios-ipa.yml",
     ".github/workflows/public-source.yml",
     ".gitignore",
     ".metadata",
